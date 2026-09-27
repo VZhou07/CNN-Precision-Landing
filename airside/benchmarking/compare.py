@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import platform
 from pathlib import Path
 import sys
 from time import perf_counter
@@ -26,13 +27,41 @@ def orb_matches(left, right, top_k=500, ratio=0.55):
             np.array([kp2[m.trainIdx].pt for m in matches], np.float32).reshape(-1, 2))
 
 
-def load_xfeat(top_k):
+def load_xfeat(top_k, device="auto"):
     submodule = HERE.parents[1] / "accelerated_features"
     if not (submodule / "modules/xfeat.py").is_file():
         raise RuntimeError("Run: git submodule update --init --recursive")
     sys.path.insert(0, str(submodule))
+    print("Loading PyTorch and XFeat (first import may take a few seconds)...", flush=True)
+    import torch
     from modules.xfeat import XFeat
-    return XFeat(top_k=top_k)
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested, but this PyTorch environment has no available CUDA device. Use --device cpu or auto.")
+    model = XFeat(top_k=top_k)
+    if device != "auto":
+        model.dev = torch.device(device)
+        model.to(model.dev)
+    return model
+
+
+def xfeat_matches(model, left, right, min_cossim=-1):
+    """Upstream sparse XFeat + mutual nearest neighbours, with empty-image handling."""
+    import torch
+    with torch.inference_mode():
+        features = [model.detectAndCompute(model.parse_input(image[..., None]))[0]
+                    for image in (left, right)]
+        if any(len(feature["keypoints"]) == 0 for feature in features):
+            return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
+        indices = model.match(features[0]["descriptors"], features[1]["descriptors"],
+                              min_cossim=min_cossim)
+        return tuple(feature["keypoints"][index].cpu().numpy()
+                     for feature, index in zip(features, indices))
+
+
+def synchronize(model):
+    if model is not None and model.dev.type == "cuda":
+        import torch
+        torch.cuda.synchronize(model.dev)
 
 
 def geometry(points1, points2):
@@ -52,36 +81,57 @@ def main():
     parser.add_argument("--output", type=Path, default=HERE / "results")
     parser.add_argument("--top-k", type=int, default=500)
     parser.add_argument("--ratio", type=float, default=0.55, help="ORB Lowe ratio")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="XFeat device; ORB always uses CPU")
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--min-cossim", type=float, default=-1,
+                        help="XFeat cosine cutoff; -1 disables filtering, as upstream match_xfeat does")
     args = parser.parse_args()
     if args.top_k <= 0 or not 0 < args.ratio < 1:
         parser.error("--top-k must be positive and --ratio must be between 0 and 1")
+    if args.warmup < 0 or args.repeats < 1 or not -1 <= args.min_cossim <= 1:
+        parser.error("--warmup >= 0, --repeats >= 1, and -1 <= --min-cossim <= 1 required")
     pairs = json.loads((args.assets / "manifest.json").read_text(encoding="utf-8"))
     if not pairs:
         parser.error("The manifest is empty")
     methods = ("orb", "xfeat") if args.method == "both" else (args.method,)
-    model = load_xfeat(args.top_k) if "xfeat" in methods else None
+    model = load_xfeat(args.top_k, args.device) if "xfeat" in methods else None
     args.output.mkdir(parents=True, exist_ok=True)
     rows = []
+    samples = []
     for pair in pairs:
         images = [cv2.imread(str(args.assets / pair[key]), cv2.IMREAD_GRAYSCALE)
                   for key in ("left", "right")]
         if any(image is None for image in images):
             raise FileNotFoundError(f"Cannot read pair {pair['pair']} in {args.assets}")
         for method in methods:
-            started = perf_counter()
             if method == "orb":
-                points1, points2 = orb_matches(*images, args.top_k, args.ratio)
+                run = lambda: orb_matches(*images, args.top_k, args.ratio)
                 device = "cpu"
             else:
-                # Upstream numpy parser expects HWC uint8 and normalizes to [0, 1].
-                points1, points2 = model.match_xfeat(images[0][..., None], images[1][..., None])
+                run = lambda: xfeat_matches(model, *images, args.min_cossim)
                 device = str(model.dev)
-            elapsed_ms = (perf_counter() - started) * 1000
+            active_model = model if method == "xfeat" else None
+            for _ in range(args.warmup):
+                run()
+            timings = []
+            for repeat in range(args.repeats):
+                synchronize(active_model)
+                started = perf_counter()
+                points1, points2 = run()
+                synchronize(active_model)
+                elapsed_ms = (perf_counter() - started) * 1000
+                timings.append(elapsed_ms)
+                samples.append(dict(pair=pair["pair"], method=method, repeat=repeat,
+                                    matching_ms=elapsed_ms))
+            cv2.setRNGSeed(0)
             _, inliers = geometry(points1, points2)
             row = dict(pair=pair["pair"], method=method, device=device, top_k=args.top_k,
                        matches=len(points1), inliers=int(inliers.sum()),
                        inlier_ratio=float(inliers.mean()) if len(inliers) else 0.0,
-                       matching_ms=round(elapsed_ms, 3))
+                       matching_ms_median=round(float(np.median(timings)), 3),
+                       matching_ms_p95=round(float(np.percentile(timings, 95)), 3))
             rows.append(row)
             print(row)
             kp1 = [cv2.KeyPoint(float(x), float(y), 1) for x, y in points1[:100]]
@@ -96,6 +146,23 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    with (args.output / "timings.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(samples[0]))
+        writer.writeheader()
+        writer.writerows(samples)
+    metadata = dict(python=sys.version, executable=sys.executable, platform=platform.platform(),
+                    processor=platform.processor(), numpy=np.__version__, opencv=cv2.__version__,
+                    opencv_threads=cv2.getNumThreads(),
+                    arguments={key: str(value) if isinstance(value, Path) else value
+                               for key, value in vars(args).items()},
+                    timing_scope="Both image extractions and matching, including input/output transfers; excludes model loading, image reading, RANSAC, drawing and writing. Quality metrics use the final repeat.")
+    if model is not None:
+        import torch
+        metadata.update(torch=torch.__version__, torch_threads=torch.get_num_threads(),
+                        cuda_build=torch.version.cuda, xfeat_device=str(model.dev),
+                        gpu=torch.cuda.get_device_name(model.dev) if model.dev.type == "cuda" else None)
+    (args.output / "run.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"Saved metrics, raw timings, environment metadata, and previews to {args.output}")
 
 
 if __name__ == "__main__":
